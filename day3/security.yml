@@ -1,0 +1,227 @@
+# Day 3 pipeline: six security gates. Copy to .github/workflows/security.yml
+#
+# Stuck? Every gate that fails also posts HINTS:
+#   - a red annotation at the top of the run page, pointing at the file to open
+#   - a "Hints" card in the job Summary with 3 levels you can open one at a time:
+#       Hint 1 = where to look, Hint 2 = why it is a problem, Hint 3 = how to fix it
+#   Try Hint 1 first. Only open the next one if you are still stuck.
+name: Security
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: 1 Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: scan
+        run: >
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest
+          detect --source /repo --no-git --no-banner --redact -v
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=site/config.js,line=3,title=Gate 1 hint::A secret is written inside a file in site/. In the log, look for the line that starts with 'File:'."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 1 failed: a secret was found in the code
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          In the log, find the lines that start with **`File:`** and **`RuleID:`**. They tell you which file holds the secret.
+          The value shows as `REDACTED` so the log does not leak it a second time.
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          The repo is **public**. Anyone on the internet can read a password or token written in the code, and git keeps it in the history.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          Nothing in the site uses the file `site/config.js`. Delete it: `git rm site/config.js`, then commit and push.
+          At a real company you would also **rotate** (change) the leaked password and token, because they stay in the git history.
+          </details>
+          EOF
+
+  sast:
+    name: 2 SAST (semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: scan
+        run: >
+          docker run --rm -v "$PWD:/src" semgrep/semgrep
+          semgrep scan --config /src/day3/semgrep-rules.yml --error --metrics off /src/site
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=site/search.js,line=5,title=Gate 2 hint::Our own JavaScript writes text from the URL into the page in an unsafe way. Open site/search.js."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 2 failed: unsafe code in our own JavaScript
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          The log prints the file path (it starts with `/src/site/...`; drop the `/src`), then the line number and the line of code.
+          Under the rule name there is a short message that explains the problem.
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          `innerHTML` reads text as **HTML**. Try opening the site with
+          `?name=<img src=x onerror=alert('hacked')>` added to the URL. The browser would run that script. This attack is called XSS.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          In `site/search.js`, change `.innerHTML` to `.textContent`. Then the browser shows the value as plain text.
+          (Or copy `day3/fixes/site/search.js`.)
+          </details>
+          EOF
+
+  sca:
+    name: 3 SCA (trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: scan
+        run: >
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest
+          fs --scanners vuln --severity HIGH,CRITICAL --exit-code 1 /src
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=package.json,title=Gate 3 hint::A library we depend on has known vulnerabilities. Our own code is fine. Check package.json and package-lock.json."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 3 failed: a library we use has known vulnerabilities
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          Above the table, Trivy prints the file it scanned (`package-lock.json`). In the table, read three columns:
+          **Library**, **Installed Version** and **Fixed Version**.
+          That library is listed in `package.json` and `package-lock.json`.
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          We did not write this library, but it ships with our app. Each `CVE-...` ID is a publicly known security hole in it,
+          and attackers search for apps that still use the old version.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          Upgrade the library to the version in the **Fixed Version** column (or newer).
+          Update **both** `package.json` and `package-lock.json`. The quickest way is to copy them from `day3/fixes/`.
+          If you have Node.js installed, `npm install lodash@latest` also works.
+          </details>
+          EOF
+
+  image:
+    name: 4 Image scan (trivy image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t hello-devops:scan .
+      - id: scan
+        run: >
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest
+          image --severity CRITICAL --ignore-unfixed --exit-code 1 hello-devops:scan
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=Dockerfile,line=2,title=Gate 4 hint::The vulnerable packages come from the base image on the FROM line. Our own files are fine. Open the Dockerfile."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 4 failed: the container image has critical vulnerabilities
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          The log lists packages like `libc6`, `openssl` and `zlib1g`. **We never installed these.**
+          The top line of the table names the operating system inside the image (for example `debian 10`).
+          So where did they come from? Open the `Dockerfile` and read the **`FROM`** line.
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          `FROM nginx:1.19` uses a base image from 2020, built on an operating system that no longer gets security updates.
+          Every image built on it brings along all of its old holes.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          Use a current, small base image and install the latest patches when the image is built:
+          ```dockerfile
+          FROM nginx:stable-alpine
+          RUN apk upgrade --no-cache
+          ```
+          Or copy `day3/fixes/Dockerfile` **and** the `day3/fixes/nginx/` folder to the repo root. That also fixes Gate 6.
+          </details>
+          EOF
+
+  iac:
+    name: 5 IaC scan (trivy config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - id: scan
+        run: >
+          docker run --rm -v "$PWD:/src" aquasec/trivy:latest
+          config --severity HIGH,CRITICAL --exit-code 1 /src/infra
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=infra/main.tf,line=11,title=Gate 5 hint::A firewall rule lets the whole internet in. Open infra/main.tf and read the cidr_blocks line."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 5 failed: insecure infrastructure code
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          Trivy prints the file (`main.tf`) and the line numbers, and it shows the lines of code it is unhappy with.
+          Find which port the rule opens (`from_port` / `to_port`) and **who** it is open to (`cidr_blocks`).
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          `0.0.0.0/0` means **every IP address on the internet**. Port 22 is SSH (remote login).
+          Bots scan the whole internet for open SSH ports and try to guess passwords.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          Allow SSH only from the office network. In `infra/main.tf`, change it to:
+          `cidr_blocks = ["10.20.0.0/16"]`
+          </details>
+          EOF
+
+  dast:
+    name: 6 DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t hello-devops:scan .
+      - run: docker run -d --name web -p 8080:80 hello-devops:scan
+      - id: scan
+        run: >
+          docker run --rm --network host --user root -v "$PWD/day3:/zap/wrk"
+          ghcr.io/zaproxy/zaproxy:stable
+          zap-baseline.py -t http://localhost:8080 -c zap-rules.tsv -I
+      - name: Hints
+        if: failure() && steps.scan.outcome == 'failure'
+        run: |
+          echo "::error file=Dockerfile,title=Gate 6 hint::The running website is missing security headers. This is not a bug in the HTML or JS. The web server (nginx) must send the headers, and the Dockerfile sets nginx up."
+          echo "Headers the site sends right now:"
+          curl -sI http://localhost:8080 || true
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## 💡 Gate 6 failed: the running website is missing security headers
+          <details><summary><b>Hint 1: where to look</b></summary>
+
+          Find the `FAIL-NEW:` lines in the log. The number in brackets (for example `[10020]`) is the ZAP rule ID.
+          DAST tests the **running** website from the outside, so the problem is not in one line of code.
+          It is in the **HTTP response headers** that the web server sends.
+          Open the "Hints" step log to see the headers the site sends now.
+          You can check locally too: `docker run -p 8080:80 ...`, then `curl -I http://localhost:8080`.
+          </details>
+          <details><summary><b>Hint 2: why it is a problem</b></summary>
+
+          * No `X-Frame-Options`: a bad website can load ours inside an invisible frame and trick users into clicking (**clickjacking**).
+          * No `X-Content-Type-Options: nosniff`: the browser may guess a file's type and run something as a script.
+          </details>
+          <details><summary><b>Hint 3: how to fix it</b></summary>
+
+          nginx needs a config file that adds the headers, and the Dockerfile has to copy it into the image.
+          Copy `day3/fixes/nginx/` to the repo root (it has `security-headers.conf`) and use `day3/fixes/Dockerfile`:
+          ```dockerfile
+          COPY nginx/security-headers.conf /etc/nginx/conf.d/security-headers.conf
+          ```
+          The same fix also clears Gate 4.
+          </details>
+          EOF
